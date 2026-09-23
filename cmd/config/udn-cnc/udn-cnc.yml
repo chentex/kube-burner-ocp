@@ -2,6 +2,8 @@
 global:
   gc: {{.GC}}
   gcMetrics: {{.GC_METRICS}}
+  templateVars:
+    TOPOLOGY: {{.TOPOLOGY}}
 {{ if .PPROF }}
   measurements:
     - name: pprof

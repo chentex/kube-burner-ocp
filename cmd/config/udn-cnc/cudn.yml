@@ -21,9 +21,16 @@ spec:
   {{- $secondOctet := mod $pairIdx 256 }}
   {{- $cudnCidr := print $firstOctet "." $secondOctet ".0.0/16" }}
   network:
-    topology: Layer3
+    topology: {{.TOPOLOGY | default "Layer2"}}
+    {{- if eq (.TOPOLOGY | default "Layer2") "Layer2" }}
+    layer2:
+      subnets:
+        - cidr: {{$cudnCidr}}
+          hostSubnet: 24
+    {{- else }}
     layer3:
       role: Primary
       subnets:
         - cidr: {{$cudnCidr}}
           hostSubnet: 24
+    {{- end }}

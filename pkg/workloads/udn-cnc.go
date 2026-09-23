@@ -35,6 +35,7 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 	var iterations int
 	var pprof bool
 	var connectivity string
+	var topology string
 	var podReadyThreshold, pprofInterval, jobPause time.Duration
 	var metricsProfiles []string
 	var rc int
@@ -49,6 +50,7 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 			AdditionalVars["JOB_PAUSE"] = jobPause
 			AdditionalVars["JOB_ITERATIONS"] = iterations
 			AdditionalVars["CONNECTIVITY"] = connectivity
+			AdditionalVars["TOPOLOGY"] = topology
 			AdditionalVars["POD_READY_THRESHOLD"] = podReadyThreshold
 			wh.SetMeasurements(udnCncMeasurementFactoryMap)
 			rc = RunWorkload(cmd, wh, cmd.Name()+".yml")
@@ -59,6 +61,7 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 	}
 	cmd.Flags().IntVar(&iterations, "iterations", 0, "Number of CUDN pairs to create (each pair = 2 namespaces + 2 CUDNs + 1 CNC)")
 	cmd.Flags().StringVar(&connectivity, "connectivity", "PodNetwork,ServiceNetwork", "Comma-separated connectivity types for ClusterNetworkConnect")
+	cmd.Flags().StringVar(&topology, "topology", "Layer2", "CUDN topology: Layer2 or Layer3")
 	cmd.Flags().DurationVar(&podReadyThreshold, "pod-ready-threshold", 2*time.Minute, "Pod ready timeout threshold")
 	cmd.Flags().DurationVar(&jobPause, "job-pause", 1*time.Minute, "Pause after CNC creation to allow OVN-K network settling")
 	cmd.Flags().BoolVar(&pprof, "pprof", false, "Enable pprof collection for ovnkube components")
