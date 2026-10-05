@@ -37,6 +37,14 @@ spec:
               - key: node-role.kubernetes.io/workload
                 operator: DoesNotExist
       containers:
+      - name: iperf3-client
+        image: quay.io/cloud-bulldozer/k8s-netperf:latest
+        command: ["sleep", "infinity"]
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            memory: "10Mi"
+            cpu: "10m"
       - name: client-app
         image: quay.io/cloud-bulldozer/curl:latest
         {{- $side := mod .Iteration 2 }}

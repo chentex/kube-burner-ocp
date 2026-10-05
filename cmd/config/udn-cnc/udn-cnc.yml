@@ -2,8 +2,6 @@
 global:
   gc: {{.GC}}
   gcMetrics: {{.GC_METRICS}}
-  templateVars:
-    TOPOLOGY: {{.TOPOLOGY}}
 {{ if .PPROF }}
   measurements:
     - name: pprof
@@ -45,12 +43,11 @@ metricsEndpoints:
       metricsDirectory: collected-metrics-{{.UUID}}
 {{ end }}
 
-{{ $numNamespaces := mul .JOB_ITERATIONS 2 }}
 jobs:
-  # Job 1: Create namespaces (2 per pair)
+  # Job 1: Create namespaces
   - name: udn-cnc-create-namespaces
     namespace: udn-cnc
-    jobIterations: {{$numNamespaces}}
+    jobIterations: {{.NUM_NAMESPACES}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: true
@@ -66,9 +63,9 @@ jobs:
       - objectTemplate: configmap.yml
         replicas: 1
 
-  # Job 2: Create CUDNs (2 per pair, cluster-scoped)
+  # Job 2: Create CUDNs (cluster-scoped)
   - name: udn-cnc-create-cudns
-    jobIterations: {{$numNamespaces}}
+    jobIterations: {{.NUM_NAMESPACES}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: false
@@ -78,14 +75,17 @@ jobs:
     objects:
       - objectTemplate: cudn.yml
         replicas: 1
+        inputVars:
+          TOPOLOGY: "{{.TOPOLOGY}}"
+          MODE: "{{.MODE}}"
         waitOptions:
           customStatusPaths:
             - key: .conditions[] | select(.type=="NetworkCreated") | .status
               value: "True"
 
-  # Job 3: Create ClusterNetworkConnect (1 per pair, cluster-scoped)
+  # Job 3: Create ClusterNetworkConnect (cluster-scoped)
   - name: udn-cnc-create-cnc
-    jobIterations: {{.JOB_ITERATIONS}}
+    jobIterations: {{.NUM_CNCS}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: false
@@ -98,11 +98,12 @@ jobs:
         replicas: 1
         inputVars:
           connectivity: "{{.CONNECTIVITY}}"
+          MODE: "{{.MODE}}"
 
   # Job 4: Deploy workload into all namespaces
   - name: udn-cnc-workload
     namespace: udn-cnc
-    jobIterations: {{$numNamespaces}}
+    jobIterations: {{.NUM_NAMESPACES}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: true
@@ -114,6 +115,7 @@ jobs:
           - conditionType: Ready
             metric: P99
             threshold: {{.POD_READY_THRESHOLD}}
+      - name: dataplaneLatency
     jobPause: 2m
     metricsClosing: afterJobPause
     cleanup: false
@@ -139,7 +141,7 @@ jobs:
       - objectTemplate: deployment-server.yml
         replicas: 1
         inputVars:
-          podReplicas: 2
+          podReplicas: 1
 
       - objectTemplate: deployment-client.yml
         replicas: 1

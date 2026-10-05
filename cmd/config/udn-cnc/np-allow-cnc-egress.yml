@@ -11,6 +11,8 @@ spec:
     ports:
     - protocol: TCP
       port: 8080
+    - protocol: TCP
+      port: 5201
   - to: []
     ports:
     - protocol: UDP

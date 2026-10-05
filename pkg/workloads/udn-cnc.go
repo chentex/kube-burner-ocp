@@ -26,16 +26,16 @@ import (
 )
 
 var udnCncMeasurementFactoryMap = map[string]kubeburnermeasurements.NewMeasurementFactory{
-	"cudnLatency": measurements.NewCudnLatencyMeasurementFactory,
-	"cncLatency":  measurements.NewCncLatencyMeasurementFactory,
+	"cudnLatency":      measurements.NewCudnLatencyMeasurementFactory,
+	"cncLatency":       measurements.NewCncLatencyMeasurementFactory,
+	"dataplaneLatency": measurements.NewDataplaneLatencyMeasurementFactory,
 }
 
 // NewUDNCNC holds udn-cnc workload
 func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 	var iterations int
 	var pprof bool
-	var connectivity string
-	var topology string
+	var connectivity, topology, mode string
 	var podReadyThreshold, pprofInterval, jobPause time.Duration
 	var metricsProfiles []string
 	var rc int
@@ -44,14 +44,24 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 		Short:        "Runs udn-cnc workload testing ClusterNetworkConnect between CUDN pairs",
 		SilenceUsage: true,
 		Run: func(cmd *cobra.Command, args []string) {
+			numNamespaces := iterations * 2
+			numCNCs := iterations
+			if mode == "mesh" {
+				numNamespaces = iterations
+				numCNCs = 1
+			}
 			setMetrics(cmd, metricsProfiles)
 			AdditionalVars["PPROF"] = pprof
 			AdditionalVars["PPROF_INTERVAL"] = pprofInterval.String()
 			AdditionalVars["JOB_PAUSE"] = jobPause
 			AdditionalVars["JOB_ITERATIONS"] = iterations
+			AdditionalVars["NUM_NAMESPACES"] = numNamespaces
+			AdditionalVars["NUM_CNCS"] = numCNCs
 			AdditionalVars["CONNECTIVITY"] = connectivity
 			AdditionalVars["TOPOLOGY"] = topology
+			AdditionalVars["MODE"] = mode
 			AdditionalVars["POD_READY_THRESHOLD"] = podReadyThreshold
+			measurements.UDNCNCMode = mode
 			wh.SetMeasurements(udnCncMeasurementFactoryMap)
 			rc = RunWorkload(cmd, wh, cmd.Name()+".yml")
 		},
@@ -59,9 +69,10 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 			os.Exit(rc)
 		},
 	}
-	cmd.Flags().IntVar(&iterations, "iterations", 0, "Number of CUDN pairs to create (each pair = 2 namespaces + 2 CUDNs + 1 CNC)")
+	cmd.Flags().IntVar(&iterations, "iterations", 0, "Number of iterations: pairs in pair mode, namespaces in mesh mode")
 	cmd.Flags().StringVar(&connectivity, "connectivity", "PodNetwork,ServiceNetwork", "Comma-separated connectivity types for ClusterNetworkConnect")
 	cmd.Flags().StringVar(&topology, "topology", "Layer2", "CUDN topology: Layer2 or Layer3")
+	cmd.Flags().StringVar(&mode, "mode", "pair", "Connectivity mode: pair (N pairs, N CNCs) or mesh (N namespaces, 1 CNC connecting all)")
 	cmd.Flags().DurationVar(&podReadyThreshold, "pod-ready-threshold", 2*time.Minute, "Pod ready timeout threshold")
 	cmd.Flags().DurationVar(&jobPause, "job-pause", 1*time.Minute, "Pause after CNC creation to allow OVN-K network settling")
 	cmd.Flags().BoolVar(&pprof, "pprof", false, "Enable pprof collection for ovnkube components")

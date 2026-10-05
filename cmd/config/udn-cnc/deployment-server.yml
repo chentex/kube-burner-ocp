@@ -41,12 +41,26 @@ spec:
         volumeMounts:
         - name: podinfo
           mountPath: /etc/podlabels
+        - name: nginx-logs
+          mountPath: /var/log/nginx
         imagePullPolicy: IfNotPresent
         ports:
         - name: http
           containerPort: 8080
           protocol: TCP
         name: nginx
+      - name: iperf3-server
+        image: quay.io/cloud-bulldozer/k8s-netperf:latest
+        command: ["iperf3", "-s", "-p", "5201"]
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: iperf3
+          containerPort: 5201
+          protocol: TCP
+        resources:
+          requests:
+            memory: "10Mi"
+            cpu: "10m"
       volumes:
       - name: podinfo
         downwardAPI:
@@ -54,3 +68,5 @@ spec:
             - path: "labels"
               fieldRef:
                 fieldPath: metadata.labels
+      - name: nginx-logs
+        emptyDir: {}
