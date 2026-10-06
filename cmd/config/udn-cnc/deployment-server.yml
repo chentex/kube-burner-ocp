@@ -17,11 +17,19 @@ spec:
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: ScheduleAnyway
+        whenUnsatisfiable: DoNotSchedule
         labelSelector:
           matchLabels:
             app: nginx
       affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: client
+              topologyKey: kubernetes.io/hostname
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
@@ -56,6 +64,18 @@ spec:
         ports:
         - name: iperf3
           containerPort: 5201
+          protocol: TCP
+        resources:
+          requests:
+            memory: "10Mi"
+            cpu: "10m"
+      - name: netserver
+        image: quay.io/cloud-bulldozer/k8s-netperf:latest
+        command: ["netserver", "-D"]
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: netserver
+          containerPort: 12865
           protocol: TCP
         resources:
           requests:

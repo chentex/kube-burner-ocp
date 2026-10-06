@@ -12,5 +12,9 @@ spec:
       port: 8080
     - protocol: TCP
       port: 5201
+    - protocol: UDP
+      port: 5201
+    - protocol: TCP
+      port: 12865
   policyTypes:
   - Ingress

@@ -1,0 +1,40 @@
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: udn-cnc-cudn-{{.Iteration}}
+  labels:
+    {{- $k := .Iteration | int}}
+    {{- $meshSize := .MESH_SIZE | int}}
+    {{- $meshIdx := div $k $meshSize}}
+    {{- $cudnIdx := mod $k $meshSize}}
+    {{- range $j := until $meshSize}}
+    {{- if lt $j $cudnIdx}}
+    udn-cnc-multiply-{{$meshIdx}}-{{$j}}-{{$cudnIdx}}: ""
+    {{- else if gt $j $cudnIdx}}
+    udn-cnc-multiply-{{$meshIdx}}-{{$cudnIdx}}-{{$j}}: ""
+    {{- end}}
+    {{- end}}
+spec:
+  {{- $nsName := print "udn-cnc-" .Iteration }}
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: In
+      values: ["{{$nsName}}"]
+  {{- $firstOctet := add (div .Iteration 256) 40 }}
+  {{- $secondOctet := mod .Iteration 256 }}
+  {{- $cudnCidr := print $firstOctet "." $secondOctet ".0.0/16" }}
+  network:
+    topology: {{.TOPOLOGY | default "Layer2"}}
+    {{- if eq (.TOPOLOGY | default "Layer2") "Layer2" }}
+    layer2:
+      role: Primary
+      subnets:
+        - "{{$cudnCidr}}"
+    {{- else }}
+    layer3:
+      role: Primary
+      subnets:
+        - cidr: {{$cudnCidr}}
+          hostSubnet: 24
+    {{- end }}

@@ -10,8 +10,16 @@ spec:
     protocol: TCP
     port: 8080
     targetPort: 8080
-  - name: iperf3
+  - name: iperf3-tcp
     protocol: TCP
     port: 5201
     targetPort: 5201
+  - name: iperf3-udp
+    protocol: UDP
+    port: 5201
+    targetPort: 5201
+  - name: netserver
+    protocol: TCP
+    port: 12865
+    targetPort: 12865
   type: ClusterIP
