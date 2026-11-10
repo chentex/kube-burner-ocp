@@ -22,4 +22,8 @@ spec:
     protocol: TCP
     port: 12865
     targetPort: 12865
+  - name: netserver-data
+    protocol: TCP
+    port: 12866
+    targetPort: 12866
   type: ClusterIP
