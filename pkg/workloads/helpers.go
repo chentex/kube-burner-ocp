@@ -29,14 +29,19 @@ import (
 	"github.com/kube-burner/kube-burner/v2/pkg/config"
 	kubeburnerutil "github.com/kube-burner/kube-burner/v2/pkg/util"
 	"github.com/kube-burner/kube-burner/v2/pkg/workloads"
+	configv1 "github.com/openshift/api/config/v1"
+	"github.com/openshift/client-go/config/clientset/versioned"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -63,6 +68,100 @@ func setMetrics(cmd *cobra.Command, metricsProfiles []string) {
 		metricsProfiles = append(metricsProfiles, "metrics-report.yml")
 	}
 	os.Setenv("METRICS", strings.Join(metricsProfiles, ","))
+}
+
+const networkConnectFeatureGate configv1.FeatureGateName = "NetworkConnect"
+
+// waitClusterNetworkConnectCRD enables the NetworkConnect feature gate (which
+// the udn-cnc workload requires and which is only present on beta/dev-preview
+// clusters) and then blocks until the network operator has rolled out and
+// established the ClusterNetworkConnect CRD. The udn-cnc workload cannot create
+// any ClusterNetworkConnect objects until the CRD exists. It returns an error
+// when the feature gate cannot be enabled or the timeout is reached.
+func waitClusterNetworkConnectCRD(cmd *cobra.Command) error {
+	timeout := 20 * time.Minute
+	if v, err := cmd.Flags().GetDuration("cnc-ready-timeout"); err == nil {
+		timeout = v
+	}
+	_, restConfig := config.NewKubeClientProvider("", "").ClientSet(0, 0)
+	openshiftClientset, err := versioned.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("error creating OpenShift clientset: %w", err)
+	}
+	if err := enableNetworkConnectFeatureGate(openshiftClientset); err != nil {
+		return err
+	}
+	return waitForCRDEstablished(dynamic.NewForConfigOrDie(restConfig), "clusternetworkconnects.k8s.ovn.org", 5*time.Second, timeout)
+}
+
+// enableNetworkConnectFeatureGate ensures the NetworkConnect feature gate is
+// enabled. It is idempotent: when the gate is already present in
+// customNoUpgrade.enabled it makes no change. Otherwise it switches the
+// featureSet to CustomNoUpgrade (which cannot be changed back) and appends the
+// gate, retrying on conflict. This is required because the workload only runs
+// on beta clusters where the gate is not enabled by default.
+func enableNetworkConnectFeatureGate(clientset versioned.Interface) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fg, err := clientset.ConfigV1().FeatureGates().Get(context.Background(), "cluster", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("error getting featuregate cluster: %w", err)
+		}
+		custom := fg.Spec.CustomNoUpgrade
+		if custom == nil {
+			custom = &configv1.CustomFeatureGates{}
+		}
+		// Idempotency: leave the gate untouched when already enabled.
+		for _, name := range custom.Enabled {
+			if name == networkConnectFeatureGate {
+				log.Infof("Feature gate %q is already enabled", networkConnectFeatureGate)
+				return nil
+			}
+		}
+		log.Infof("Enabling feature gate %q (featureSet=CustomNoUpgrade, prevents upgrades)", networkConnectFeatureGate)
+		fg.Spec.FeatureSet = configv1.CustomNoUpgrade
+		custom.Enabled = append(custom.Enabled, networkConnectFeatureGate)
+		fg.Spec.CustomNoUpgrade = custom
+		if _, err := clientset.ConfigV1().FeatureGates().Update(context.Background(), fg, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("error updating featuregate cluster: %w", err)
+		}
+		log.Infof("Feature gate %q enabled", networkConnectFeatureGate)
+		return nil
+	})
+}
+
+// waitForCRDEstablished polls the given CRD until its Established condition is
+// True. It returns an error when the CRD is not established within the timeout
+// or when the API call fails with a non-NotFound error.
+func waitForCRDEstablished(dyn dynamic.Interface, crdName string, pollInterval, timeout time.Duration) error {
+	crdGVR := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+	log.Infof("Waiting for %s CRD to be established (timeout %s)...", crdName, timeout)
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
+		crd, err := dyn.Resource(crdGVR).Get(ctx, crdName, metav1.GetOptions{})
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				log.Debugf("%s CRD not found yet", crdName)
+				return false, nil
+			}
+			return false, err
+		}
+		conds, _, _ := unstructured.NestedSlice(crd.UnstructuredContent(), "status", "conditions")
+		for _, c := range conds {
+			cond, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cond["type"] == "Established" && cond["status"] == "True" {
+				log.Infof("%s CRD is established", crdName)
+				return true, nil
+			}
+		}
+		log.Debugf("%s CRD not established yet", crdName)
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%s CRD not established within %s: %w", crdName, timeout, err)
+	}
+	return nil
 }
 
 // SetKubeBurnerFlags configures the required environment variables and flags for kube-burner

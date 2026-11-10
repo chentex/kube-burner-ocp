@@ -131,6 +131,9 @@
   metricName: serviceCount
   instant: true
 
+- query: topk(20, max by (resource) (apiserver_storage_objects))
+  metricName: etcdStorageObjects
+
 - query: count(openshift_route_created{})
   metricName: routeCount
   instant: true

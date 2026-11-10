@@ -8,19 +8,29 @@ spec:
       clusterUserDefinedNetworkSelector:
         networkSelector:
           matchLabels:
-            {{- if eq (.MODE | default "pair") "pair" }}
-            udn-cnc-pair-{{.Iteration}}: ""
-            {{- else }}
-            udn-cnc-mesh: ""
-            {{- end }}
-  {{- $firstOctet := add (div .Iteration 256) 60 }}
-  {{- $secondOctet := mod .Iteration 256 }}
-  {{- $cncCidr := print $firstOctet "." $secondOctet ".0.0/16" }}
+            {{- $c := .Iteration | int}}
+            {{- $meshSize := max (.MESH_SIZE | int) 2}}
+            {{- if eq (.MODE | default "pair") "multiply"}}
+            {{- $allPairs := .PAIRS_JSON | fromJson}}
+            {{- $pair := index $allPairs $c}}
+            {{- $group := index $pair 0 | int}}
+            {{- $nsI := index $pair 1 | int}}
+            {{- $nsJ := index $pair 2 | int}}
+            udn-cnc-multiply-{{$group}}-{{$nsI}}-{{$nsJ}}: ""
+            {{- else if eq (.MODE | default "pair") "mesh"}}
+            udn-cnc-group-{{$c}}: ""
+            {{- else}}
+            {{- $cncsPerGroup := div $meshSize 2}}
+            udn-cnc-pair-{{div $c $cncsPerGroup}}-{{mod $c $cncsPerGroup}}: ""
+            {{- end}}
+  {{- $firstOctet := add (div $c 256) 60}}
+  {{- $secondOctet := mod $c 256}}
+  {{- $cncCidr := print $firstOctet "." $secondOctet ".0.0/16"}}
   connectSubnets:
   - cidr: "{{$cncCidr}}"
     networkPrefix: 24
   connectivity:
-  {{- $connectivityList := splitList "," .connectivity }}
+  {{- $connectivityList := splitList "," .connectivity}}
   {{- range $connectivityList }}
     - {{ . | trim }}
-  {{- end }}
+  {{- end}}

@@ -16,5 +16,7 @@ spec:
       port: 5201
     - protocol: TCP
       port: 12865
+    - protocol: TCP
+      port: 12866
   policyTypes:
   - Ingress

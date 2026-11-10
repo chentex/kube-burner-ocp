@@ -15,6 +15,7 @@
 package measurements
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/kube-burner/kube-burner/v2/pkg/measurements/types"
 	"github.com/kube-burner/kube-burner/v2/pkg/util/fileutils"
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -128,7 +130,10 @@ func (c *cncLatency) handleAdd(obj any) {
 
 func (c *cncLatency) handleUpdate(oldObj, newObj any) {
 	cnc := newObj.(*unstructured.Unstructured)
-	cncName, _, _ := unstructured.NestedString(cnc.UnstructuredContent(), "metadata", "name")
+	cncName, found, _ := unstructured.NestedString(cnc.UnstructuredContent(), "metadata", "name")
+	if !found || cncName == "" {
+		return
+	}
 
 	transitionTime, succeeded := getCncAcceptedTransitionTime(cnc)
 	if !succeeded {
@@ -185,7 +190,10 @@ func (c *cncLatency) Start(measurementWg *sync.WaitGroup) error {
 	}
 
 	c.stopCh = make(chan struct{})
-	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(c.dynamicClient, 0, "", nil)
+	jobLabelSelector := fmt.Sprintf("kube-burner.io/job=%s", c.JobConfig.Name)
+	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(c.dynamicClient, 0, "", func(opts *metav1.ListOptions) {
+		opts.LabelSelector = jobLabelSelector
+	})
 	cncInformer := factory.ForResource(cncGVR).Informer()
 	cncInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.handleAdd,

@@ -55,14 +55,23 @@ spec:
             cpu: "10m"
       - name: client-app
         image: quay.io/cloud-bulldozer/curl:latest
-        {{- $side := mod .Iteration 2 }}
-        {{- $peerNs := ternary (add .Iteration 1) (sub .Iteration 1) (eq $side 0) }}
+        {{- $k := .Iteration | int }}
+        {{- $meshSize := .MESH_SIZE | int }}
+        {{- $group := div $k $meshSize }}
+        {{- $local := mod $k $meshSize }}
+        {{- $isPair := eq (.MODE | default "pair") "pair" }}
+        {{- $pairPeer := ternary (add $local 1) (sub $local 1) (eq (mod $local 2) 0) }}
+        {{- $meshPeer := ternary (add $local 1) (sub $local 1) (lt $local (sub $meshSize 1)) }}
+        {{- $peerLocal := ternary $pairPeer $meshPeer $isPair }}
+        {{- $peerNs := add (mul $group $meshSize) $peerLocal }}
+        {{- $connectivityList := splitList "," (.CONNECTIVITY | default "PodNetwork,ServiceNetwork") }}
+        {{- $svcName := ternary "cnc-svc" "cnc-headless-svc" (has "ServiceNetwork" $connectivityList) }}
         command:
           - "/bin/sh"
           - "-c"
           - |
             while true; do
-              curl --fail -sS http://cnc-svc.udn-cnc-{{ $peerNs }}.svc.cluster.local:8080 -o /dev/null 2>/dev/null && echo "OK->ns-{{ $peerNs }}" || echo "FAIL->ns-{{ $peerNs }}";
+              curl --fail -sS http://{{ $svcName }}.udn-cnc-{{ $peerNs }}.svc.cluster.local:8080 -o /dev/null 2>/dev/null && echo "OK->ns-{{ $peerNs }}" || echo "FAIL->ns-{{ $peerNs }}";
               sleep 10
             done
         resources:
@@ -77,7 +86,7 @@ spec:
             command:
             - "/bin/sh"
             - "-c"
-            - "curl --fail -sS http://cnc-svc.udn-cnc-{{ $peerNs }}.svc.cluster.local:8080/ -o /dev/null"
+            - "curl --fail -sS http://{{ $svcName }}.udn-cnc-{{ $peerNs }}.svc.cluster.local:8080/ -o /dev/null"
           periodSeconds: 1
           timeoutSeconds: 5
           failureThreshold: 60

@@ -36,7 +36,16 @@ import (
 const (
 	cudnLatencyMeasurementName      = "cudnLatencyMeasurement"
 	cudnLatencyQuantilesMeasurement = "cudnLatencyQuantilesMeasurement"
-	cudnReadyConditionType          = "NetworkCreated"
+	// conditionTypeNetworkCreated is True when the UDN controller created the
+	// NetworkAttachmentDefinition. Readiness signal for both Layer2 and Layer3.
+	conditionTypeNetworkCreated = "NetworkCreated"
+	// conditionTypeNetworkAllocationSucceeded is True when node allocation
+	// finished for all synced nodes. Only meaningful for Layer3 (per-node
+	// subnets); for Layer2 ovn-k allocates only network IDs/tunnel keys at
+	// controller init, so it transitions together with NetworkCreated.
+	conditionTypeNetworkAllocationSucceeded = "NetworkAllocationSucceeded"
+	// topologyLayer3 matches spec.network.topology for Layer3 CUDNs.
+	topologyLayer3 = "Layer3"
 )
 
 var (
@@ -49,13 +58,15 @@ var (
 )
 
 type cudnMetric struct {
-	Timestamp             time.Time `json:"timestamp"`
-	MetricName            string    `json:"metricName"`
-	UUID                  string    `json:"uuid"`
-	JobName               string    `json:"jobName,omitempty"`
-	Name                  string    `json:"cudnName"`
-	Metadata              any       `json:"metadata,omitempty"`
-	NetworkCreatedLatency int       `json:"networkAllocLatency"`
+	Timestamp                time.Time `json:"timestamp"`
+	MetricName               string    `json:"metricName"`
+	UUID                     string    `json:"uuid"`
+	JobName                  string    `json:"jobName,omitempty"`
+	Name                     string    `json:"cudnName"`
+	Metadata                 any       `json:"metadata,omitempty"`
+	Topology                 string    `json:"topology,omitempty"`
+	NetworkCreatedLatency    int       `json:"networkCreatedLatency"`
+	NetworkAllocationLatency int       `json:"networkAllocationLatency"`
 }
 
 type cudnLatency struct {
@@ -88,7 +99,7 @@ func (c *cudnLatency) handleAdd(obj any) {
 		log.Error("CUDN object missing metadata.name, skipping")
 		return
 	}
-	ts, found, _ := unstructured.NestedString(cudn.UnstructuredContent(), "metadata", "creationTimestamp")
+	ts, _, _ := unstructured.NestedString(cudn.UnstructuredContent(), "metadata", "creationTimestamp")
 	if !found || ts == "" {
 		log.Errorf("CUDN %s missing creationTimestamp, skipping", cudnName)
 		return
@@ -99,62 +110,77 @@ func (c *cudnLatency) handleAdd(obj any) {
 		return
 	}
 
-	// Check if NetworkCreated is already True at creation time
-	if transitionTime, ok := getNetworkAllocTransitionTime(cudn); ok {
-		latency := transitionTime.Sub(t).Milliseconds()
-		log.Debugf("CUDN %s already has NetworkCreated=True, latency: %dms", cudnName, latency)
-		c.Metrics.LoadOrStore(cudnName, cudnMetric{
-			Name:                  cudnName,
-			Timestamp:             t.UTC(),
-			MetricName:            cudnLatencyMeasurementName,
-			UUID:                  c.Uuid,
-			Metadata:              c.Metadata,
-			JobName:               c.JobConfig.Name,
-			NetworkCreatedLatency: int(latency),
-		})
-		return
+	// Store creation timestamp; latencies start pending and are filled in as
+	// conditions transition (or immediately, if the informer delivered an
+	// object that was already ready).
+	m := cudnMetric{
+		Name:                     cudnName,
+		Timestamp:                t.UTC(),
+		MetricName:               cudnLatencyMeasurementName,
+		UUID:                     c.Uuid,
+		Metadata:                 c.Metadata,
+		JobName:                  c.JobConfig.Name,
+		Topology:                 cudnTopology(cudn),
+		NetworkCreatedLatency:    -1, // Not yet ready
+		NetworkAllocationLatency: -1, // Not yet ready
 	}
-
-	// Store creation timestamp, latency will be computed on update
-	c.Metrics.LoadOrStore(cudnName, cudnMetric{
-		Name:                  cudnName,
-		Timestamp:             t.UTC(),
-		MetricName:            cudnLatencyMeasurementName,
-		UUID:                  c.Uuid,
-		Metadata:              c.Metadata,
-		JobName:               c.JobConfig.Name,
-		NetworkCreatedLatency: -1, // Not yet ready
-	})
-	log.Debugf("CUDN %s created at %v, waiting for NetworkCreated", cudnName, t.UTC())
+	stored, _ := c.Metrics.LoadOrStore(cudnName, m)
+	c.fillTransitionTimes(cudn, stored.(cudnMetric))
+	log.Debugf("CUDN %s (%s) created at %v, waiting for NetworkCreated", cudnName, m.Topology, t.UTC())
 }
 
 func (c *cudnLatency) handleUpdate(oldObj, newObj any) {
 	cudn := newObj.(*unstructured.Unstructured)
 	cudnName, _, _ := unstructured.NestedString(cudn.UnstructuredContent(), "metadata", "name")
 
-	transitionTime, succeeded := getNetworkAllocTransitionTime(cudn)
-	if !succeeded {
-		return
-	}
-
 	val, ok := c.Metrics.Load(cudnName)
 	if !ok {
 		return
 	}
 	m := val.(cudnMetric)
-	if m.NetworkCreatedLatency >= 0 {
-		return // Already recorded
+	if m.NetworkCreatedLatency >= 0 && (m.Topology != topologyLayer3 || m.NetworkAllocationLatency >= 0) {
+		return // all latencies relevant to this topology already recorded
 	}
-
-	latency := transitionTime.Sub(m.Timestamp).Milliseconds()
-	m.NetworkCreatedLatency = int(latency)
-	c.Metrics.Store(cudnName, m)
-	log.Debugf("CUDN %s NetworkCreated after %dms", cudnName, latency)
+	c.fillTransitionTimes(cudn, m)
 }
 
-// getNetworkAllocTransitionTime returns the lastTransitionTime of the
-// NetworkCreated=True condition, and true if found.
-func getNetworkAllocTransitionTime(cudn *unstructured.Unstructured) (time.Time, bool) {
+// fillTransitionTimes fills the pending latency fields of m from the
+// transition times of the CUDN conditions:
+//
+//   - NetworkCreated (both topologies): creation -> NAD created
+//   - NetworkAllocationSucceeded (Layer3 only): creation -> all node subnets
+//     allocated. Skipped for Layer2, where ovn-k allocates only network IDs
+//     and tunnel keys at controller init, so it transitions together with
+//     NetworkCreated and carries no additional signal.
+//
+// The updated metric is stored back; pending (-1) fields are left untouched.
+func (c *cudnLatency) fillTransitionTimes(cudn *unstructured.Unstructured, m cudnMetric) {
+	if m.NetworkCreatedLatency < 0 {
+		if t, ok := getConditionTransitionTime(cudn, conditionTypeNetworkCreated); ok {
+			latency := t.Sub(m.Timestamp).Milliseconds()
+			m.NetworkCreatedLatency = int(latency)
+			log.Debugf("CUDN %s NetworkCreated after %dms", m.Name, latency)
+		}
+	}
+	if m.NetworkAllocationLatency < 0 && m.Topology == topologyLayer3 {
+		if t, ok := getConditionTransitionTime(cudn, conditionTypeNetworkAllocationSucceeded); ok {
+			latency := t.Sub(m.Timestamp).Milliseconds()
+			m.NetworkAllocationLatency = int(latency)
+			log.Debugf("CUDN %s NetworkAllocationSucceeded after %dms", m.Name, latency)
+		}
+	}
+	c.Metrics.Store(m.Name, m)
+}
+
+// cudnTopology returns spec.network.topology ("" when unset).
+func cudnTopology(cudn *unstructured.Unstructured) string {
+	topology, _, _ := unstructured.NestedString(cudn.UnstructuredContent(), "spec", "network", "topology")
+	return topology
+}
+
+// getConditionTransitionTime returns the lastTransitionTime of the given
+// True status condition, and true if found.
+func getConditionTransitionTime(cudn *unstructured.Unstructured, condType string) (time.Time, bool) {
 	conditions, found, err := unstructured.NestedSlice(cudn.UnstructuredContent(), "status", "conditions")
 	if err != nil || !found {
 		return time.Time{}, false
@@ -164,15 +190,15 @@ func getNetworkAllocTransitionTime(cudn *unstructured.Unstructured) (time.Time, 
 		if !ok {
 			continue
 		}
-		condType, _, _ := unstructured.NestedString(condition, "type")
+		condTypeField, _, _ := unstructured.NestedString(condition, "type")
 		condStatus, _, _ := unstructured.NestedString(condition, "status")
-		if condType == cudnReadyConditionType && condStatus == "True" {
+		if condTypeField == condType && condStatus == "True" {
 			ltt, _, _ := unstructured.NestedString(condition, "lastTransitionTime")
 			if t, err := time.Parse(time.RFC3339, ltt); err == nil {
 				return t, true
 			}
 			// Fall back to current time if lastTransitionTime is missing
-			log.Warnf("CUDN %s: NetworkCreated=True but missing lastTransitionTime, using current time", cudn.GetName())
+			log.Warnf("CUDN %s: %s=True but missing lastTransitionTime, using current time", cudn.GetName(), condType)
 			return time.Now().UTC(), true
 		}
 	}
@@ -222,6 +248,9 @@ func (c *cudnLatency) normalizeMetrics() float64 {
 			log.Warnf("CUDN %s never reached NetworkCreated=True, excluding from latency metrics", m.Name)
 			return true
 		}
+		if m.Topology == topologyLayer3 && m.NetworkAllocationLatency < 0 {
+			log.Warnf("Layer3 CUDN %s never reached NetworkAllocationSucceeded=True, NetworkAllocationLatency will be -1", m.Name)
+		}
 		c.NormLatencies = append(c.NormLatencies, m)
 		return true
 	})
@@ -230,9 +259,15 @@ func (c *cudnLatency) normalizeMetrics() float64 {
 
 func (c *cudnLatency) getLatency(normLatency any) map[string]float64 {
 	m := normLatency.(cudnMetric)
-	return map[string]float64{
+	latencies := map[string]float64{
 		"NetworkCreatedLatency": float64(m.NetworkCreatedLatency),
 	}
+	// Layer3-only metric; -1 means not recorded (Layer2 or condition never
+	// reached), so it must not enter the quantiles.
+	if m.NetworkAllocationLatency >= 0 {
+		latencies["NetworkAllocationLatency"] = float64(m.NetworkAllocationLatency)
+	}
+	return latencies
 }
 
 func (c *cudnLatency) IsCompatible() bool {

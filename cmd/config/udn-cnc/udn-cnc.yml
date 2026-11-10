@@ -44,7 +44,7 @@ metricsEndpoints:
 {{ end }}
 
 jobs:
-  # Job 1: Create namespaces
+  # Job 1: Create namespaces (M * S, one per CUDN)
   - name: udn-cnc-create-namespaces
     namespace: udn-cnc
     jobIterations: {{.NUM_NAMESPACES}}
@@ -63,7 +63,7 @@ jobs:
       - objectTemplate: configmap.yml
         replicas: 1
 
-  # Job 2: Create CUDNs (cluster-scoped)
+  # Job 2: Create CUDNs (cluster-scoped), one per namespace
   - name: udn-cnc-create-cudns
     jobIterations: {{.NUM_NAMESPACES}}
     qps: {{.QPS}}
@@ -78,12 +78,18 @@ jobs:
         inputVars:
           TOPOLOGY: "{{.TOPOLOGY}}"
           MODE: "{{.MODE}}"
+          MESH_SIZE: "{{.MESH_SIZE}}"
         waitOptions:
           customStatusPaths:
             - key: .conditions[] | select(.type=="NetworkCreated") | .status
               value: "True"
+            {{ if eq .TOPOLOGY "Layer3" }}
+            # Wait for per-node subnet allocation (Layer3 only).
+            - key: .conditions[] | select(.type=="NetworkAllocationSucceeded") | .status
+              value: "True"
+            {{ end }}
 
-  # Job 3: Create ClusterNetworkConnect (cluster-scoped)
+  # Job 3: Create ClusterNetworkConnects (cluster-scoped), cncsPerGroup per iteration
   - name: udn-cnc-create-cnc
     jobIterations: {{.NUM_CNCS}}
     qps: {{.QPS}}
@@ -99,6 +105,8 @@ jobs:
         inputVars:
           connectivity: "{{.CONNECTIVITY}}"
           MODE: "{{.MODE}}"
+          MESH_SIZE: "{{.MESH_SIZE}}"
+          PAIRS_JSON: '{{.PAIRS_JSON}}'
 
   # Job 4: Deploy workload into all namespaces
   - name: udn-cnc-workload
@@ -129,6 +137,9 @@ jobs:
       - objectTemplate: service.yml
         replicas: 1
 
+      - objectTemplate: service-headless.yml
+        replicas: 1
+
       - objectTemplate: np-deny-all.yml
         replicas: 1
 
@@ -147,6 +158,9 @@ jobs:
         replicas: 1
         inputVars:
           podReplicas: 1
+          MODE: "{{.MODE}}"
+          MESH_SIZE: "{{.MESH_SIZE}}"
+          CONNECTIVITY: "{{.CONNECTIVITY}}"
 
 {{ if .GC }}
   # Cleanup Job 5: Delete namespaces (waitForDeletion: false — CUDN finalizers block)

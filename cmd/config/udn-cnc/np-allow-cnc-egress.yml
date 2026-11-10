@@ -7,21 +7,6 @@ spec:
     matchLabels:
       app: client
   egress:
-  - to: []
-    ports:
-    - protocol: TCP
-      port: 8080
-    - protocol: TCP
-      port: 5201
-    - protocol: UDP
-      port: 5201
-    - protocol: TCP
-      port: 12865
-  - to: []
-    ports:
-    - protocol: UDP
-      port: 53
-    - protocol: TCP
-      port: 53
+  - {}
   policyTypes:
   - Egress

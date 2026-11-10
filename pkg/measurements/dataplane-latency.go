@@ -48,9 +48,20 @@ const (
 // how dataplane latency pairs are selected ("pair", "mesh", or "multiply").
 var UDNCNCMode = "pair"
 
-// UDNCNCMeshSize is set by the udn-cnc workload in multiply mode to indicate
-// the number of CUDNs per mesh group, so iperf only runs within each group.
+// UDNCNCMeshSize is set by the udn-cnc workload to indicate the number of CUDNs per group.
 var UDNCNCMeshSize = 0
+
+// UDNCNCRuntimeNsPrefix is set by workloads reusing this measurement. The
+// default is the udn-cnc namespace prefix; the cnc-dataplane workload sets
+// "cnc-dataplane" so both workloads can run their own measurement instances.
+var UDNCNCRuntimeNsPrefix = "udn-cnc"
+
+// UDNCNCRuntimeSvcName is the ClusterIP service name inside the destination
+// namespace that the client pods connect to. Default: the udn-cnc service.
+var UDNCNCRuntimeSvcName = "cnc-svc"
+
+// UDNCNCIterations is set by the udn-cnc workload to indicate the number of independent groups.
+var UDNCNCIterations = 0
 
 // UDNCNCProtocol is set by the udn-cnc workload to select the iperf3 protocol ("tcp" or "udp").
 var UDNCNCProtocol = "tcp"
@@ -78,6 +89,7 @@ type dataplaneMetric struct {
 	MetricName     string    `json:"metricName"`
 	UUID           string    `json:"uuid"`
 	JobName        string    `json:"jobName,omitempty"`
+	Mode           string    `json:"mode"`
 	Namespace      string    `json:"namespace"`
 	PeerNamespace  string    `json:"peerNamespace"`
 	Protocol       string    `json:"protocol"`
@@ -85,10 +97,10 @@ type dataplaneMetric struct {
 	Direction      string    `json:"direction"` // "forward" (client→server) or "reverse" (server→client)
 	Metadata       any       `json:"metadata,omitempty"`
 	ThroughputMbps float64   `json:"throughputMbps"`
-	Streams       int    `json:"streams"`
-	SourceNode    string `json:"sourceNode"`
-	DestNode      string `json:"destNode"`
-	CrossNode     bool   `json:"crossNode"`
+	Streams        int       `json:"streams"`
+	SourceNode     string    `json:"sourceNode"`
+	DestNode       string    `json:"destNode"`
+	CrossNode      bool      `json:"crossNode"`
 	// TCP iperf3-only
 	Retransmits int     `json:"retransmits,omitempty"`
 	MeanRTTus   float64 `json:"meanRTTus,omitempty"`
@@ -129,7 +141,16 @@ type iperfJSON struct {
 
 type dataplaneLatency struct {
 	measurements.BaseMeasurement
-	restConfig *rest.Config
+	restConfig      *rest.Config
+	mode            string
+	iterations      int
+	meshSize        int
+	protocol        string
+	parallelStreams int
+	duration        int
+	reverse         bool
+	nsPrefix        string
+	svcName         string
 }
 
 type dataplaneLatencyMeasurementFactory struct {
@@ -146,6 +167,15 @@ func (f dataplaneLatencyMeasurementFactory) NewMeasurement(jobConfig *config.Job
 	return &dataplaneLatency{
 		BaseMeasurement: f.NewBaseLatency(jobConfig, clientSet, restConfig, dataplaneLatencyMeasurementName, dataplaneLatencyQuantilesMeasurement, embedCfg),
 		restConfig:      restConfig,
+		mode:            UDNCNCMode,
+		iterations:      UDNCNCIterations,
+		meshSize:        UDNCNCMeshSize,
+		protocol:        UDNCNCProtocol,
+		parallelStreams: UDNCNCParallelStreams,
+		duration:        UDNCNCDuration,
+		reverse:         UDNCNCReverse,
+		nsPrefix:        UDNCNCRuntimeNsPrefix,
+		svcName:         UDNCNCRuntimeSvcName,
 	}
 }
 
@@ -161,10 +191,9 @@ func (d *dataplaneLatency) Collect(measurementWg *sync.WaitGroup) {
 }
 
 // runIperfPairs serializes tests sharing the same destination (iperf3 server handles one
-// client at a time) while parallelizing across destinations. All configured packet sizes
-// are tested sequentially per pair.
+// client at a time) while parallelizing across destinations. A bounded worker pool capped
+// at len(dstMu) workers ensures we never spawn more goroutines than there are destinations.
 func (d *dataplaneLatency) runIperfPairs(pairs [][2]int) {
-	var wg sync.WaitGroup
 	dstMu := make(map[int]*sync.Mutex)
 	for _, p := range pairs {
 		if _, ok := dstMu[p[1]]; !ok {
@@ -172,23 +201,39 @@ func (d *dataplaneLatency) runIperfPairs(pairs [][2]int) {
 		}
 	}
 	sizes := tcpPacketSizes
-	if UDNCNCProtocol == "udp" {
+	if d.protocol == "udp" {
 		sizes = udpPacketSizes
 	}
+
+	numWorkers := len(dstMu)
+	if numWorkers > len(pairs) {
+		numWorkers = len(pairs)
+	}
+
+	pairCh := make(chan [2]int, len(pairs))
 	for _, p := range pairs {
+		pairCh <- p
+	}
+	close(pairCh)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(src, dst int) {
+		go func() {
 			defer wg.Done()
-			dstMu[dst].Lock()
-			defer dstMu[dst].Unlock()
-			ns := fmt.Sprintf("udn-cnc-%d", src)
-			peerNs := fmt.Sprintf("udn-cnc-%d", dst)
-			for _, size := range sizes {
-				if err := d.runIperf(ns, peerNs, UDNCNCProtocol, size); err != nil {
-					log.Errorf("Data plane measurement for %s->%s [%s/%s] failed: %v", ns, peerNs, UDNCNCProtocol, size, err)
+			for p := range pairCh {
+				src, dst := p[0], p[1]
+				dstMu[dst].Lock()
+				ns := fmt.Sprintf("%s-%d", d.nsPrefix, src)
+				peerNs := fmt.Sprintf("%s-%d", d.nsPrefix, dst)
+				for _, size := range sizes {
+					if err := d.runIperf(ns, peerNs, d.protocol, size); err != nil {
+						log.Errorf("Data plane measurement for %s->%s [%s/%s] failed: %v", ns, peerNs, d.protocol, size, err)
+					}
 				}
+				dstMu[dst].Unlock()
 			}
-		}(p[0], p[1])
+		}()
 	}
 	wg.Wait()
 }
@@ -198,36 +243,30 @@ func (d *dataplaneLatency) Stop() error {
 		return nil
 	}
 
-	numNamespaces := d.JobConfig.JobIterations
+	meshSize := d.meshSize
+	if meshSize <= 0 {
+		meshSize = d.iterations
+	}
+	numGroups := d.iterations
 	var pairs [][2]int
-
-	if UDNCNCMode == "mesh" {
-		for i := 0; i < numNamespaces; i++ {
-			for j := i + 1; j < numNamespaces; j++ {
-				pairs = append(pairs, [2]int{i, j})
+	for m := 0; m < numGroups; m++ {
+		base := m * meshSize
+		if d.mode == "pair" {
+			// pair mode: (0,1), (2,3), ... within each group
+			for k := 0; k+1 < meshSize; k += 2 {
+				pairs = append(pairs, [2]int{base + k, base + k + 1})
 			}
-		}
-	} else if UDNCNCMode == "multiply" {
-		meshSize := UDNCNCMeshSize
-		if meshSize <= 0 {
-			meshSize = numNamespaces
-		}
-		numMeshes := numNamespaces / meshSize
-		for m := 0; m < numMeshes; m++ {
+		} else {
+			// mesh and multiply: all intra-group pairs
 			for i := 0; i < meshSize; i++ {
 				for j := i + 1; j < meshSize; j++ {
-					pairs = append(pairs, [2]int{m*meshSize + i, m*meshSize + j})
+					pairs = append(pairs, [2]int{base + i, base + j})
 				}
 			}
 		}
-	} else {
-		// pair mode: each pair is independent, no shared server
-		for i := 0; i < numNamespaces; i += 2 {
-			pairs = append(pairs, [2]int{i, i + 1})
-		}
 	}
 
-	if UDNCNCProtocol == "tcp_rr" {
+	if d.protocol == "tcp_rr" {
 		d.runNetperfPairs(pairs)
 	} else {
 		d.runIperfPairs(pairs)
@@ -237,35 +276,57 @@ func (d *dataplaneLatency) Stop() error {
 }
 
 // runNetperfPairs serializes netperf TCP_RR tests to the same destination (netserver handles
-// one client at a time) while parallelizing across destinations.
+// one client at a time) while parallelizing across destinations. A bounded worker pool capped
+// at len(dstMu) workers ensures we never spawn more goroutines than there are destinations.
 func (d *dataplaneLatency) runNetperfPairs(pairs [][2]int) {
-	var wg sync.WaitGroup
 	dstMu := make(map[int]*sync.Mutex)
 	for _, p := range pairs {
 		if _, ok := dstMu[p[1]]; !ok {
 			dstMu[p[1]] = &sync.Mutex{}
 		}
 	}
+
+	numWorkers := len(dstMu)
+	if numWorkers > len(pairs) {
+		numWorkers = len(pairs)
+	}
+
+	pairCh := make(chan [2]int, len(pairs))
 	for _, p := range pairs {
+		pairCh <- p
+	}
+	close(pairCh)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(src, dst int) {
+		go func() {
 			defer wg.Done()
-			dstMu[dst].Lock()
-			defer dstMu[dst].Unlock()
-			ns := fmt.Sprintf("udn-cnc-%d", src)
-			peerNs := fmt.Sprintf("udn-cnc-%d", dst)
-			for _, sizes := range netperfReqRespSizes {
-				if err := d.runNetperf(ns, peerNs, sizes[0], sizes[1]); err != nil {
-					log.Errorf("Netperf TCP_RR %s->%s [%d/%d] failed: %v", ns, peerNs, sizes[0], sizes[1], err)
+			for p := range pairCh {
+				src, dst := p[0], p[1]
+				dstMu[dst].Lock()
+				ns := fmt.Sprintf("%s-%d", d.nsPrefix, src)
+				peerNs := fmt.Sprintf("%s-%d", d.nsPrefix, dst)
+				for _, sizes := range netperfReqRespSizes {
+					if err := d.runNetperf(ns, peerNs, sizes[0], sizes[1]); err != nil {
+						log.Errorf("Netperf TCP_RR %s->%s [%d/%d] failed: %v", ns, peerNs, sizes[0], sizes[1], err)
+					}
 				}
+				dstMu[dst].Unlock()
 			}
-		}(p[0], p[1])
+		}()
 	}
 	wg.Wait()
 }
 
 func (d *dataplaneLatency) runNetperf(ns, peerNs string, reqSize, respSize int) error {
-	ctx := context.Background()
+	duration := d.duration
+	if duration < 1 {
+		duration = 10
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration+60)*time.Second)
+	defer cancel()
+
 	pods, err := d.ClientSet.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=client",
 	})
@@ -289,16 +350,13 @@ func (d *dataplaneLatency) runNetperf(ns, peerNs string, reqSize, respSize int) 
 	}
 	destNode := serverPods.Items[0].Spec.NodeName
 
-	serverDNS := fmt.Sprintf("cnc-svc.%s.svc.cluster.local", peerNs)
-	duration := UDNCNCDuration
-	if duration < 1 {
-		duration = 10
-	}
+	serverDNS := fmt.Sprintf("%s.%s.svc.cluster.local", d.svcName, peerNs)
 	packetSize := fmt.Sprintf("%d/%d", reqSize, respSize)
 	cmd := []string{
 		"netperf", "-t", "TCP_RR", "-H", serverDNS, "-l", fmt.Sprintf("%d", duration),
 		"--",
 		"-r", fmt.Sprintf("%d,%d", reqSize, respSize),
+		"-P", "0,12866",
 		"-o", "MIN_LATENCY,MEAN_LATENCY,MAX_LATENCY,STDDEV_LATENCY,TRANSACTION_RATE",
 	}
 
@@ -317,9 +375,7 @@ func (d *dataplaneLatency) runNetperf(ns, peerNs string, reqSize, respSize int) 
 		TTY:       false,
 	}, scheme.ParameterCodec)
 
-	execRestConfig := *d.restConfig
-	execRestConfig.Timeout = 0
-	executor, err := remotecommand.NewSPDYExecutor(&execRestConfig, "POST", req.URL())
+	executor, err := remotecommand.NewSPDYExecutor(d.restConfig, "POST", req.URL())
 	if err != nil {
 		return fmt.Errorf("failed to create executor for %s/%s: %v", ns, pod.Name, err)
 	}
@@ -340,6 +396,7 @@ func (d *dataplaneLatency) runNetperf(ns, peerNs string, reqSize, respSize int) 
 		MetricName:      dataplaneLatencyMeasurementName,
 		UUID:            d.Uuid,
 		JobName:         d.JobConfig.Name,
+		Mode:            d.mode,
 		Namespace:       ns,
 		PeerNamespace:   peerNs,
 		Protocol:        "tcp_rr",
@@ -392,7 +449,17 @@ func parseNetperfCSV(output string) (minLat, meanLat, maxLat, stddevLat, txRate 
 }
 
 func (d *dataplaneLatency) runIperf(ns, peerNs, protocol, packetSize string) error {
-	ctx := context.Background()
+	streams := d.parallelStreams
+	if streams < 1 {
+		streams = 1
+	}
+	duration := d.duration
+	if duration < 1 {
+		duration = 10
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration+60)*time.Second)
+	defer cancel()
+
 	pods, err := d.ClientSet.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=client",
 	})
@@ -416,21 +483,13 @@ func (d *dataplaneLatency) runIperf(ns, peerNs, protocol, packetSize string) err
 	}
 	destNode := serverPods.Items[0].Spec.NodeName
 
-	serverDNS := fmt.Sprintf("cnc-svc.%s.svc.cluster.local", peerNs)
-	streams := UDNCNCParallelStreams
-	if streams < 1 {
-		streams = 1
-	}
-	duration := UDNCNCDuration
-	if duration < 1 {
-		duration = 10
-	}
+	serverDNS := fmt.Sprintf("%s.%s.svc.cluster.local", d.svcName, peerNs)
 	direction := "forward"
 	cmd := []string{"iperf3", "-J", "-c", serverDNS, "-t", fmt.Sprintf("%d", duration), "-l", packetSize, "-P", fmt.Sprintf("%d", streams)}
 	if protocol == "udp" {
 		cmd = append(cmd, "-u", "-b", "100M")
 	}
-	if UDNCNCReverse {
+	if d.reverse {
 		if protocol == "udp" {
 			log.Warnf("iperf3 UDP reverse mode is unreliable; skipping reverse for %s->%s [%s/%s]", ns, peerNs, protocol, packetSize)
 			return nil
@@ -454,9 +513,7 @@ func (d *dataplaneLatency) runIperf(ns, peerNs, protocol, packetSize string) err
 		TTY:       false,
 	}, scheme.ParameterCodec)
 
-	execRestConfig := *d.restConfig
-	execRestConfig.Timeout = 0
-	executor, err := remotecommand.NewSPDYExecutor(&execRestConfig, "POST", req.URL())
+	executor, err := remotecommand.NewSPDYExecutor(d.restConfig, "POST", req.URL())
 	if err != nil {
 		return fmt.Errorf("failed to create executor for %s/%s: %v", ns, pod.Name, err)
 	}
@@ -478,6 +535,7 @@ func (d *dataplaneLatency) runIperf(ns, peerNs, protocol, packetSize string) err
 		MetricName:    dataplaneLatencyMeasurementName,
 		UUID:          d.Uuid,
 		JobName:       d.JobConfig.Name,
+		Mode:          d.mode,
 		Namespace:     ns,
 		PeerNamespace: peerNs,
 		Protocol:      protocol,
@@ -541,6 +599,9 @@ func (d *dataplaneLatency) getLatency(normLatency any) map[string]float64 {
 	case "tcp_rr":
 		return map[string]float64{
 			"MeanLatencyUs":   m.MeanRTTus,
+			"MinLatencyUs":    m.MinLatencyUs,
+			"MaxLatencyUs":    m.MaxLatencyUs,
+			"StddevLatencyUs": m.StddevLatencyUs,
 			"TransactionRate": m.TransactionRate,
 		}
 	default:
