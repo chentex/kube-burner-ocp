@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 )
 
@@ -94,6 +95,57 @@ func waitClusterNetworkConnectCRD(cmd *cobra.Command) error {
 	return waitForCRDEstablished(dynamic.NewForConfigOrDie(restConfig), "clusternetworkconnects.k8s.ovn.org", 5*time.Second, timeout)
 }
 
+const (
+	ovnkubeNamespace = "openshift-ovn-kubernetes"
+	ovnkubeDaemonset = "ovnkube-node"
+)
+
+// waitOvnkubeDaemonsetRolledOut blocks until the ovnkube-node daemonset is
+// fully rolled out: every node that should run the daemon has it updated and
+// ready. This ensures the network controller on each node is running with the
+// NetworkConnect feature gate before any CUDN/CNC is created. It returns an
+// error when the timeout is reached or the API call fails.
+func waitOvnkubeDaemonsetRolledOut(cmd *cobra.Command) error {
+	timeout := 20 * time.Minute
+	if v, err := cmd.Flags().GetDuration("cnc-ready-timeout"); err == nil {
+		timeout = v
+	}
+	clientset, _ := config.NewKubeClientProvider("", "").ClientSet(0, 0)
+	return waitForDaemonsetRolledOut(clientset, ovnkubeNamespace, ovnkubeDaemonset, 5*time.Second, timeout)
+}
+
+// waitForDaemonsetRolledOut polls the given daemonset until
+// updatedNumberScheduled and numberReady both equal desiredNumberScheduled.
+// A missing daemonset keeps polling (it may not exist yet while the operator
+// rolls out); any other API error fails fast.
+func waitForDaemonsetRolledOut(clientset kubernetes.Interface, namespace, name string, pollInterval, timeout time.Duration) error {
+	log.Infof("⏳ Waiting for %s/%s daemonset to be fully rolled out (timeout %s)...", namespace, name, timeout)
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
+		ds, err := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				log.Debugf("%s/%s daemonset not found yet", namespace, name)
+				return false, nil
+			}
+			return false, err
+		}
+		if ds.Status.DesiredNumberScheduled == 0 {
+			log.Debugf("%s/%s daemonset has no nodes scheduled yet", namespace, name)
+			return false, nil
+		}
+		if ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled && ds.Status.NumberReady == ds.Status.DesiredNumberScheduled {
+			log.Infof("%s/%s daemonset fully rolled out: %d/%d nodes updated and ready", namespace, name, ds.Status.NumberReady, ds.Status.DesiredNumberScheduled)
+			return true, nil
+		}
+		log.Debugf("%s/%s daemonset not fully rolled out yet: updated %d/%d, ready %d/%d", namespace, name, ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled, ds.Status.NumberReady, ds.Status.DesiredNumberScheduled)
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%s/%s daemonset not fully rolled out within %s: %w", namespace, name, timeout, err)
+	}
+	return nil
+}
+
 // enableNetworkConnectFeatureGate ensures the NetworkConnect feature gate is
 // enabled. It is idempotent: when the gate is already present in
 // customNoUpgrade.enabled it makes no change. Otherwise it switches the
@@ -134,7 +186,7 @@ func enableNetworkConnectFeatureGate(clientset versioned.Interface) error {
 // or when the API call fails with a non-NotFound error.
 func waitForCRDEstablished(dyn dynamic.Interface, crdName string, pollInterval, timeout time.Duration) error {
 	crdGVR := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
-	log.Infof("Waiting for %s CRD to be established (timeout %s)...", crdName, timeout)
+	log.Infof("⏳ Waiting for %s CRD to be established (timeout %s)...", crdName, timeout)
 	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		crd, err := dyn.Resource(crdGVR).Get(ctx, crdName, metav1.GetOptions{})
 		if err != nil {

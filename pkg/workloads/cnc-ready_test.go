@@ -22,12 +22,14 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	openshiftfake "github.com/openshift/client-go/config/clientset/versioned/fake"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -131,6 +133,78 @@ func TestEnableNetworkConnectFeatureGate(t *testing.T) {
 		client := newFakeFeatureGateClient(t, nil)
 		if err := enableNetworkConnectFeatureGate(client); err == nil {
 			t.Fatal("expected error when featuregate is absent, got nil")
+		}
+	})
+}
+
+func newFakeDaemonset(desired, updated, ready int32) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ovnkubeNamespace, Name: ovnkubeDaemonset},
+		Status: appsv1.DaemonSetStatus{
+			DesiredNumberScheduled: desired,
+			UpdatedNumberScheduled: updated,
+			NumberReady:            ready,
+		},
+	}
+}
+
+func TestWaitForDaemonsetRolledOut(t *testing.T) {
+	t.Run("fully rolled out: returns nil immediately", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset(newFakeDaemonset(8, 8, 8))
+		start := time.Now()
+		if err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 500*time.Millisecond); err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("took too long, should have returned immediately")
+		}
+	})
+
+	t.Run("updated < desired: times out", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset(newFakeDaemonset(8, 4, 8))
+		if err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 100*time.Millisecond); err == nil {
+			t.Fatal("expected timeout error, got nil")
+		}
+	})
+
+	t.Run("ready < desired: times out", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset(newFakeDaemonset(8, 8, 4))
+		if err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 100*time.Millisecond); err == nil {
+			t.Fatal("expected timeout error, got nil")
+		}
+	})
+
+	t.Run("desired = 0: times out", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset(newFakeDaemonset(0, 0, 0))
+		if err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 100*time.Millisecond); err == nil {
+			t.Fatal("expected timeout error, got nil")
+		}
+	})
+
+	t.Run("daemonset absent: keeps polling until timeout", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset()
+		start := time.Now()
+		err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 100*time.Millisecond)
+		if err == nil {
+			t.Fatal("expected timeout error, got nil")
+		}
+		if time.Since(start) < 80*time.Millisecond {
+			t.Fatalf("failed before polling again; expected to keep polling until timeout")
+		}
+	})
+
+	t.Run("non-NotFound API error: fails fast", func(t *testing.T) {
+		client := k8sfake.NewSimpleClientset()
+		client.PrependReactor("get", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("connection refused")
+		})
+		start := time.Now()
+		err := waitForDaemonsetRolledOut(client, ovnkubeNamespace, ovnkubeDaemonset, 10*time.Millisecond, 5*time.Second)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("expected fast failure, took %s", time.Since(start))
 		}
 	})
 }

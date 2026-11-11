@@ -137,6 +137,11 @@ func NewUDNCNC(wh *workloads.WorkloadHelper) *cobra.Command {
 			if err := waitClusterNetworkConnectCRD(cmd); err != nil {
 				log.Fatalf("ERROR: %v — the udn-cnc workload cannot run", err)
 			}
+			// Gate: do not create any objects until the ovnkube-node daemonset is
+			// fully rolled out on every node with the NetworkConnect feature gate.
+			if err := waitOvnkubeDaemonsetRolledOut(cmd); err != nil {
+				log.Fatalf("ERROR: %v — the udn-cnc workload cannot run", err)
+			}
 			rc = RunWorkload(cmd, wh, cmd.Name()+".yml")
 		},
 		PostRun: func(cmd *cobra.Command, args []string) {

@@ -53,6 +53,7 @@ jobs:
     namespacedIterations: true
     waitWhenFinished: true
     skipIndexing: true
+    jobPause: 3m
     namespaceLabels:
       security.openshift.io/scc.podSecurityLabelSync: false
       pod-security.kubernetes.io/enforce: privileged
